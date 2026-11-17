@@ -5,10 +5,10 @@ from discord.ext import commands
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 ALERT_CH_ID = int(os.getenv("ALERT_CHANNEL_ID", "1568991830245253263"))
-VAULT_FILE = "claimable_vault.json"
+VAULT_FILE = "verified_vault_v2.json"
 START_TIME, BOT_STATUS = time.time(), "Starting..."
 
-RANGES = [(12000000, 17300000), (32500000, 36000000)]
+RANGES = [(14000000, 17300000), (33000000, 36000000)]
 KEYWORDS = [
     "police", "swat", "sheriff", "state", "patrol", "academy", "rp", "roleplay",
     "studio", "studios", "dev", "games", "club", "fan", "official", "army",
@@ -47,8 +47,34 @@ async def pinger():
             except Exception: pass
             await asyncio.sleep(240)
 
+async def is_page_deactivated(s: aiohttp.ClientSession, gid: int) -> bool:
+    """Fetches the real roblox.com/communities/{id} page HTML to catch 'This community has been deactivated'."""
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/125.0.0.0 Mobile Safari/537.36"}
+    try:
+        async with s.get(f"https://www.roblox.com/communities/{gid}", headers=headers, timeout=8) as r:
+            if r.status != 200:
+                return True
+            html = (await r.text()).lower()
+            bad_phrases = [
+                "this community has been deactivated",
+                "community has been deactivated",
+                "community has been closed",
+                "group has been locked",
+                "page cannot be found",
+            ]
+            if any(p in html for p in bad_phrases):
+                return True
+    except Exception:
+        return False
+    return False
+
 async def inspect_group(s: aiohttp.ClientSession, gid: int) -> dict | None:
-    """5-Layer Check to filter out Deactivated, Locked, 0-Member & Content-Deleted groups."""
+    """6-Layer Check: v1 API + v2 API + /users + /roles + Live Webpage HTML Deactivation Check."""
+    # Layer 0: Check actual roblox.com/communities/{id} webpage for 'This community has been deactivated'
+    if await is_page_deactivated(s, gid):
+        SCAN["dead_skipped"] += 1
+        return None
+
     d = None
     for host in HOSTS:
         try:
@@ -67,11 +93,23 @@ async def inspect_group(s: aiohttp.ClientSession, gid: int) -> dict | None:
         return None
 
     # Layer 2: Filter out [ Content Deleted ] or 0-member deactivated groups
-    if not name or "content deleted" in name.lower() or "content deleted" in desc.lower() or members < 1:
+    if not name or "content deleted" in name.lower() or "content deleted" in desc.lower() or members < 2:
         SCAN["dead_skipped"] += 1
         return None
 
-    # Layer 3: Verify active member exists via /users (Deactivated groups have 0 real users!)
+    # Layer 3: Cross-check v2 API (Fixes Roblox bug where v1 says no owner but v2 has an owner)
+    for host in HOSTS:
+        try:
+            async with s.get(f"{host}/v2/groups?groupIds={gid}", timeout=8) as r2:
+                if r2.status == 200:
+                    v2_list = (await r2.json()).get("data", [])
+                    if not v2_list or v2_list[0].get("owner") is not None:
+                        SCAN["dead_skipped"] += 1
+                        return None
+                    break
+        except Exception: pass
+
+    # Layer 4: Verify active member exists via /users
     has_active_user = False
     for host in HOSTS:
         try:
@@ -85,7 +123,7 @@ async def inspect_group(s: aiohttp.ClientSession, gid: int) -> dict | None:
         SCAN["dead_skipped"] += 1
         return None
 
-    # Layer 4: Verify Roles & Ensure Rank 255 (Owner Role) has 0 members
+    # Layer 5: Verify Roles & Ensure Rank 255 (Owner Role) has 0 members
     roles = []
     owner_role_occupied = False
     for host in HOSTS:
@@ -268,3 +306,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
